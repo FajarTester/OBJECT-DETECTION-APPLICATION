@@ -1,18 +1,105 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import "@fontsource-variable/sora";
+import Alert, { type AlertColor } from "@mui/material/Alert";
+import CircularProgress from "@mui/material/CircularProgress";
+import LinearProgress from "@mui/material/LinearProgress";
+import Snackbar from "@mui/material/Snackbar";
+import { ThemeProvider } from "@mui/material/styles";
+import {
+  CameraOff,
+  Gauge,
+  Layers,
+  Maximize,
+  Minimize,
+  RefreshCw,
+  ScanLine,
+  ScanSearch,
+} from "lucide-react";
 
-interface DetectionResult {
-  image: string;
-  model_1_count: number;
-  model_2_count: number;
-}
+import { Brand } from "./components/hud/Brand";
+import { DetectionSummary } from "./components/hud/DetectionSummary";
+import { MobileDock } from "./components/hud/MobileDock";
+import { ModeSelector } from "./components/hud/ModeSelector";
+import { StatusPill } from "./components/hud/StatusPill";
+import { SystemStatus } from "./components/hud/SystemStatus";
+import { Viewfinder } from "./components/hud/Viewfinder";
+import { Badge } from "./components/ui/badge";
+import { Button } from "./components/ui/button";
+import { Separator } from "./components/ui/separator";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "./components/ui/tooltip";
+import { FONT_STACK, muiTheme } from "./theme";
+import {
+  isModeChangedMessage,
+  MODE_DESCRIPTIONS,
+  MODE_SUMMARY,
+  type Counts,
+  type DetectionMode,
+  type PerfStats,
+  type ServerMessage,
+} from "./types";
+import ChatWidget from "./components/chatbot/chat";
+
+// =========================================================
+// CONSTANTS
+// =========================================================
 
 const WS_URL =
   import.meta.env.VITE_WS_URL ?? "ws://192.168.18.7:8000/ws/stream";
 
+const DEFAULT_MODE: DetectionMode = "both";
+
 console.log("APP STARTED");
 console.log("WS URL:", WS_URL);
 
+interface ToastState {
+  open: boolean;
+  severity: AlertColor;
+  message: string;
+}
+
+// =========================================================
+// APP (root: provider tema MUI + tooltip shadcn)
+// =========================================================
+
 export default function App() {
+  // Cegah auto-translate browser (Google Translate) mengubah struktur DOM.
+  // React tidak tahan kalau node teks/elemennya dipindah oleh pihak luar,
+  // dan itu bisa membuat seluruh aplikasi crash (layar hitam).
+  // Efek ini juga menutup portal MUI (Drawer, Snackbar) di luar <main>.
+  useEffect(() => {
+    document.documentElement.setAttribute("translate", "no");
+
+    let meta = document.querySelector<HTMLMetaElement>(
+      'meta[name="google"][content="notranslate"]',
+    );
+
+    if (!meta) {
+      meta = document.createElement("meta");
+      meta.name = "google";
+      meta.content = "notranslate";
+      document.head.appendChild(meta);
+    }
+  }, []);
+
+  return (
+    <ThemeProvider theme={muiTheme}>
+      <TooltipProvider delayDuration={200}>
+        <VisionApp />
+      </TooltipProvider>
+    </ThemeProvider>
+  );
+}
+
+// =========================================================
+// VISION APP
+// =========================================================
+
+function VisionApp() {
   // =========================================================
   // REFS
   // =========================================================
@@ -46,16 +133,38 @@ export default function App() {
    */
   const reconnectTimerRef = useRef<number | null>(null);
 
+  /**
+   * Mode aktif disimpan di ref juga, supaya:
+   * - onopen bisa mengirim ulang mode terakhir setelah reconnect
+   * - connectWebSocket tidak perlu bergantung pada state `mode`
+   *   (kalau bergantung, WebSocket akan dibuat ulang setiap ganti mode)
+   */
+  const modeRef = useRef<DetectionMode>(DEFAULT_MODE);
+
+  /**
+   * Waktu frame terakhir dikirim, untuk menghitung latency.
+   */
+  const sentAtRef = useRef(0);
+
+  /**
+   * Jendela 1 detik untuk menghitung FPS dan rata-rata latency.
+   */
+  const perfWindowRef = useRef({ start: 0, count: 0, latencySum: 0 });
+
   // =========================================================
   // STATE
   // =========================================================
 
   const [annotatedImage, setAnnotatedImage] = useState<string | null>(null);
 
-  const [counts, setCounts] = useState({
+  const [counts, setCounts] = useState<Counts>({
     model1: 0,
     model2: 0,
   });
+
+  const [mode, setMode] = useState<DetectionMode>(DEFAULT_MODE);
+
+  const [perf, setPerf] = useState<PerfStats | null>(null);
 
   const [isConnected, setIsConnected] = useState(false);
 
@@ -69,7 +178,62 @@ export default function App() {
 
   const [debugMessage, setDebugMessage] = useState("APP STARTING");
 
-  const totalObjects = counts.model1 + counts.model2;
+  const [detailsOpen, setDetailsOpen] = useState(false);
+
+  const [toast, setToast] = useState<ToastState>({
+    open: false,
+    severity: "info",
+    message: "",
+  });
+
+  // =========================================================
+  // TOAST
+  // =========================================================
+
+  const showToast = useCallback((severity: AlertColor, message: string) => {
+    setToast({ open: true, severity, message });
+  }, []);
+
+  const closeToast = useCallback((_event?: unknown, reason?: string) => {
+    if (reason === "clickaway") {
+      return;
+    }
+
+    setToast((current) => ({ ...current, open: false }));
+  }, []);
+
+  // =========================================================
+  // CHANGE MODE
+  // =========================================================
+
+  const changeMode = useCallback(
+    (nextMode: DetectionMode) => {
+      if (modeRef.current === nextMode) {
+        return;
+      }
+
+      modeRef.current = nextMode;
+
+      // Update UI langsung (optimistic)
+      setMode(nextMode);
+
+      showToast("info", `Mode: ${MODE_SUMMARY[nextMode]}`);
+
+      const socket = wsRef.current;
+
+      // Kalau socket belum terbuka, mode akan dikirim saat onopen.
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        try {
+          socket.send(JSON.stringify({ mode: nextMode }));
+
+          console.log("Mode dikirim:", nextMode);
+        } catch (error) {
+          console.error("Gagal mengirim mode:", error);
+        }
+      }
+    },
+    [showToast],
+  );
 
   // =========================================================
   // STOP CAMERA
@@ -104,11 +268,11 @@ export default function App() {
       cameraReadyRef.current = false;
       setIsCameraReady(false);
 
-      if (!navigator.mediaDevices) {
-        throw new Error("navigator.mediaDevices tidak tersedia.");
+      if (!window.isSecureContext) {
+        throw new Error("INSECURE_CONTEXT");
       }
 
-      if (!navigator.mediaDevices.getUserMedia) {
+      if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error("getUserMedia tidak tersedia pada device ini.");
       }
 
@@ -169,9 +333,25 @@ export default function App() {
 
       setIsCameraReady(false);
 
-      setCameraError(
-        "Kamera tidak dapat diakses. Pastikan permission kamera sudah diberikan.",
-      );
+      // Pesan error dibuat spesifik supaya user tahu cara memperbaikinya.
+      const name = error instanceof DOMException ? error.name : "";
+      const message = error instanceof Error ? error.message : "";
+
+      if (message === "INSECURE_CONTEXT") {
+        setCameraError(
+          "Kamera hanya bisa dipakai lewat HTTPS atau localhost. Buka aplikasi dengan alamat HTTPS.",
+        );
+      } else if (name === "NotAllowedError") {
+        setCameraError(
+          "Izin kamera ditolak. Aktifkan izin kamera di pengaturan browser, lalu coba lagi.",
+        );
+      } else if (name === "NotFoundError") {
+        setCameraError("Kamera tidak ditemukan di perangkat ini.");
+      } else {
+        setCameraError(
+          "Kamera tidak dapat diakses. Pastikan tidak dipakai aplikasi lain, lalu coba lagi.",
+        );
+      }
     }
   }, []);
 
@@ -256,6 +436,8 @@ export default function App() {
         }
 
         try {
+          sentAtRef.current = performance.now();
+
           wsRef.current.send(blob);
 
           console.log("Frame sent:", Math.round(blob.size / 1024), "KB");
@@ -269,6 +451,24 @@ export default function App() {
       0.82,
     );
   }, []);
+
+  // =========================================================
+  // RETRY CAMERA (tombol "Try again" saat kamera gagal)
+  // =========================================================
+
+  const retryCamera = useCallback(async () => {
+    await initCamera();
+
+    if (destroyedRef.current) {
+      return;
+    }
+
+    window.setTimeout(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        captureAndSendFrame();
+      }
+    }, 300);
+  }, [initCamera, captureAndSendFrame]);
 
   // =========================================================
   // CLEAR RECONNECT TIMER
@@ -327,11 +527,6 @@ export default function App() {
       return;
     }
 
-    console.log("====================================");
-    console.log("CONNECT WEBSOCKET START");
-    console.log("TARGET:", WS_URL);
-    console.log("====================================");
-
     clearReconnectTimer();
 
     let socket: WebSocket;
@@ -361,19 +556,20 @@ export default function App() {
     // =========================================================
 
     socket.onopen = async () => {
-      console.log("====================================");
-      console.log("TARGET:", WS_URL);
       console.log("WEBSOCKET OPEN");
       setDebugMessage("WEBSOCKET OPEN");
-      console.log("====================================");
 
       setIsConnected(true);
+
+      showToast("success", "Terhubung ke server");
 
       clearReconnectTimer();
 
-      setIsConnected(true);
-
       try {
+        // Backend selalu mulai dengan mode "both" di koneksi baru,
+        // jadi kirim ulang mode terakhir yang dipilih user.
+        socket.send(JSON.stringify({ mode: modeRef.current }));
+
         // Kamera dimulai setelah WebSocket berhasil
         await initCamera();
 
@@ -402,9 +598,42 @@ export default function App() {
     // =========================================================
 
     socket.onmessage = (event) => {
-      try {
-        const data: DetectionResult = JSON.parse(event.data);
+      let data: ServerMessage;
 
+      try {
+        data = JSON.parse(event.data);
+      } catch (error) {
+        console.error("Gagal parse response WebSocket:", error);
+
+        // Lepas lock supaya stream tidak macet
+        processingRef.current = false;
+
+        requestAnimationFrame(() => {
+          if (!destroyedRef.current) {
+            captureAndSendFrame();
+          }
+        });
+
+        return;
+      }
+
+      // -----------------------------------------------
+      // KONFIRMASI MODE
+      //
+      // Ini BUKAN hasil frame, jadi jangan reset
+      // processingRef dan jangan kirim frame baru.
+      // Kalau tidak, dua frame bisa ada di antrean backend.
+      // -----------------------------------------------
+
+      if (isModeChangedMessage(data)) {
+        console.log("Mode dikonfirmasi backend:", data.current_mode);
+
+        setDebugMessage(`MODE: ${data.current_mode}`);
+
+        return;
+      }
+
+      try {
         // -----------------------------------------------
         // IMAGE
         // -----------------------------------------------
@@ -432,8 +661,37 @@ export default function App() {
         // -----------------------------------------------
 
         setLastUpdate(new Date());
+
+        // -----------------------------------------------
+        // FPS & LATENCY (dirata-rata per 1 detik)
+        // -----------------------------------------------
+
+        const now = performance.now();
+
+        const windowStats = perfWindowRef.current;
+
+        if (windowStats.start === 0) {
+          windowStats.start = now;
+        }
+
+        windowStats.count += 1;
+
+        if (sentAtRef.current > 0) {
+          windowStats.latencySum += now - sentAtRef.current;
+        }
+
+        const elapsed = now - windowStats.start;
+
+        if (elapsed >= 1000) {
+          setPerf({
+            fps: (windowStats.count * 1000) / elapsed,
+            latencyMs: windowStats.latencySum / windowStats.count,
+          });
+
+          perfWindowRef.current = { start: now, count: 0, latencySum: 0 };
+        }
       } catch (error) {
-        console.error("Gagal parse response WebSocket:", error);
+        console.error("Gagal memproses hasil deteksi:", error);
       } finally {
         // Backend sudah selesai memproses frame
         processingRef.current = false;
@@ -464,22 +722,20 @@ export default function App() {
     // =========================================================
 
     socket.onclose = (event) => {
-      console.log("====================================");
-
-      console.log("WEBSOCKET CLOSED");
-
-      console.log("CODE:", event.code);
-
-      console.log("REASON:", event.reason || "(no reason)");
-
-      console.log("WEBSOCKET CLOSED", event.code, event.reason);
+      console.log(
+        "WEBSOCKET CLOSED",
+        event.code,
+        event.reason || "(no reason)",
+      );
       setDebugMessage(`CLOSED ${event.code} ${event.reason || ""}`);
-
-      console.log("====================================");
 
       setIsConnected(false);
 
       processingRef.current = false;
+
+      perfWindowRef.current = { start: 0, count: 0, latencySum: 0 };
+
+      setPerf(null);
 
       stopCamera();
 
@@ -493,6 +749,8 @@ export default function App() {
         return;
       }
 
+      showToast("warning", "Koneksi terputus. Menyambung ulang...");
+
       // Reconnect 3 detik kemudian
       clearReconnectTimer();
 
@@ -504,7 +762,13 @@ export default function App() {
         connectWebSocket();
       }, 3000);
     };
-  }, [clearReconnectTimer, initCamera, captureAndSendFrame, stopCamera]);
+  }, [
+    clearReconnectTimer,
+    initCamera,
+    captureAndSendFrame,
+    stopCamera,
+    showToast,
+  ]);
 
   // =========================================================
   // MANUAL RECONNECT
@@ -620,11 +884,52 @@ export default function App() {
   }, [connectWebSocket, clearReconnectTimer, stopCamera]);
 
   // =========================================================
+  // DERIVED
+  // =========================================================
+
+  const ModeIcon = mode === "both" ? Layers : ScanLine;
+
+  const modeIconClass =
+    mode === "model_1"
+      ? "text-emerald-400"
+      : mode === "model_2"
+        ? "text-red-400"
+        : "text-white/70";
+
+  const fullscreenLabel = isFullscreen ? "Exit fullscreen" : "Fullscreen";
+
+  // Aksi berlabel, dipakai di drawer mobile
+  const detailActions = (
+    <div className="mt-5 grid grid-cols-2 gap-2">
+      <Button variant="secondary" onClick={toggleFullscreen}>
+        {isFullscreen ? <Minimize /> : <Maximize />}
+
+        <span>{fullscreenLabel}</span>
+      </Button>
+
+      <Button
+        variant="secondary"
+        onClick={() => {
+          setDetailsOpen(false);
+          reconnect();
+        }}
+      >
+        <RefreshCw />
+        Reconnect
+      </Button>
+    </div>
+  );
+
+  // =========================================================
   // UI
   // =========================================================
 
   return (
-    <main className="fixed inset-0 overflow-hidden bg-slate-950 text-white">
+    <main
+      translate="no"
+      className="notranslate fixed inset-0 flex overflow-hidden bg-slate-950 text-white antialiased"
+      style={{ fontFamily: FONT_STACK }}
+    >
       {/* =====================================================
           HIDDEN CAMERA
       ===================================================== */}
@@ -632,994 +937,258 @@ export default function App() {
       <video ref={videoRef} muted playsInline autoPlay className="hidden" />
 
       <canvas ref={canvasRef} className="hidden" />
-
+      <ChatWidget />
       {/* =====================================================
-          CAMERA / DETECTION VIEW
+          DESKTOP SIDEBAR
       ===================================================== */}
 
-      <div className="absolute inset-0 flex items-center justify-center bg-black">
-        {annotatedImage ? (
-          <img
-            src={annotatedImage}
-            alt="Live AI Detection"
-            className="
-              h-full
-              w-full
-              object-contain
-              select-none
-            "
-          />
-        ) : (
-          <div
-            className="
-            flex
-            flex-col
-            items-center
-            justify-center
-            px-6
-            text-center
-          "
-          >
-            {/* CAMERA ICON */}
+      <aside className="hidden w-80 shrink-0 flex-col border-r border-white/10 bg-slate-950 lg:flex">
+        <div className="flex items-center justify-between gap-3 p-5">
+          <Brand />
 
-            <div
-              className="
-              mb-5
-              flex
-              h-16
-              w-16
-              items-center
-              justify-center
-              rounded-2xl
-              border
-              border-white/10
-              bg-white/5
-            "
-            >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.7"
-                className="h-7 w-7 text-white/70"
-              >
-                <path
-                  d="M4 7h3l2-2h6l2 2h3v11H4z"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
+          <StatusPill isConnected={isConnected} />
+        </div>
 
-                <circle cx="12" cy="12" r="3" />
-              </svg>
-            </div>
+        <Separator />
 
-            <h2
-              className="
-              text-xl
-              font-bold
-              tracking-tight
-            "
-            >
-              Vision Detection
+        <div className="flex-1 space-y-7 overflow-y-auto p-5">
+          <DetectionSummary counts={counts} mode={mode} />
+
+          <Separator />
+
+          <section>
+            <h2 className="mb-3 text-sm font-medium text-white/80">
+              Detection mode
             </h2>
 
-            <p
-              className="
-              mt-2
-              max-w-sm
-              text-sm
-              text-white/50
-            "
-            >
-              {cameraError
-                ? cameraError
-                : isConnected
-                  ? "Kamera siap. Menunggu hasil deteksi..."
-                  : "Menghubungkan ke detection server..."}
+            <ModeSelector mode={mode} onChange={changeMode} />
+
+            <p className="mt-3 text-xs leading-relaxed text-white/45">
+              {MODE_DESCRIPTIONS[mode]}
             </p>
+          </section>
 
-            {/* STATUS */}
+          <Separator />
 
-            <div
-              className="
-              mt-5
-              flex
-              items-center
-              gap-2
-              rounded-full
-              border
-              border-white/10
-              bg-white/5
-              px-4
-              py-2
-              text-xs
-              text-white/60
-            "
-            >
-              <span
-                className={`
-                  h-2
-                  w-2
-                  rounded-full
-                  ${isConnected ? "animate-pulse bg-emerald-400" : "bg-red-400"}
-                `}
-              />
+          <section>
+            <h2 className="mb-4 text-sm font-medium text-white/80">System</h2>
 
-              {isConnected ? "Server Connected" : "Server Offline"}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* =====================================================
-          DARK OVERLAY
-      ===================================================== */}
-
-      <div
-        className="
-        pointer-events-none
-        absolute
-        inset-0
-        bg-gradient-to-b
-        from-black/55
-        via-transparent
-        to-black/80
-      "
-      />
-
-      {/* =====================================================
-          TOP HEADER
-      ===================================================== */}
-
-      <header
-        className="
-        absolute
-        left-0
-        right-0
-        top-0
-        z-30
-        p-3
-        sm:p-4
-      "
-      >
-        <div className="absolute left-3 top-20 z-50 max-w-[90%] rounded-xl bg-black/80 px-3 py-2 text-xs text-white">
-          {debugMessage}
-        </div>
-
-        <div
-          className="
-          mx-auto
-          flex
-          max-w-7xl
-          items-center
-          justify-between
-          rounded-2xl
-          border
-          border-white/10
-          bg-black/45
-          px-3
-          py-2.5
-          shadow-xl
-          backdrop-blur-xl
-          sm:px-4
-          sm:py-3
-        "
-        >
-          {/* BRAND */}
-
-          <div className="flex items-center gap-3">
-            <div
-              className="
-              flex
-              h-9
-              w-9
-              items-center
-              justify-center
-              rounded-xl
-              bg-white
-              text-slate-950
-              shadow-lg
-              sm:h-10
-              sm:w-10
-            "
-            >
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.8"
-                className="h-5 w-5"
-              >
-                <path
-                  d="M4 7h3l2-2h6l2 2h3v11H4z"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-
-                <circle cx="12" cy="12" r="3" />
-              </svg>
-            </div>
-
-            <div>
-              <h1
-                className="
-                text-sm
-                font-bold
-                tracking-tight
-                sm:text-base
-              "
-              >
-                Vision Detection
-              </h1>
-
-              <p
-                className="
-                text-[10px]
-                text-white/40
-                sm:text-[11px]
-              "
-              >
-                AI Object Monitoring
-              </p>
-            </div>
-          </div>
-
-          {/* RIGHT CONTROLS */}
-
-          <div className="flex items-center gap-2">
-            {/* CONNECTION */}
-
-            <div
-              className="
-              flex
-              items-center
-              gap-2
-              rounded-full
-              border
-              border-white/10
-              bg-white/5
-              px-3
-              py-1.5
-            "
-            >
-              <span
-                className={`
-                  h-2
-                  w-2
-                  rounded-full
-                  ${isConnected ? "animate-pulse bg-emerald-400" : "bg-red-400"}
-                `}
-              />
-
-              <span
-                className="
-                text-[11px]
-                font-semibold
-                sm:text-xs
-              "
-              >
-                {isConnected ? "LIVE" : "OFFLINE"}
-              </span>
-            </div>
-
-            {/* FULLSCREEN */}
-
-            <button
-              type="button"
-              onClick={toggleFullscreen}
-              className="
-                hidden
-                h-9
-                w-9
-                items-center
-                justify-center
-                rounded-xl
-                border
-                border-white/10
-                bg-white/5
-                transition
-                hover:bg-white/10
-                active:scale-95
-                sm:flex
-              "
-              aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
-            >
-              {isFullscreen ? (
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  className="h-4 w-4"
-                >
-                  <path d="M9 9H4V4" />
-                  <path d="M15 9h5V4" />
-                  <path d="M9 15H4v5" />
-                  <path d="M15 15h5v5" />
-                </svg>
-              ) : (
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  className="h-4 w-4"
-                >
-                  <path d="M4 9V4h5" />
-                  <path d="M15 4h5v5" />
-                  <path d="M20 15v5h-5" />
-                  <path d="M9 20H4v-5" />
-                </svg>
-              )}
-            </button>
-          </div>
-        </div>
-      </header>
-
-      {/* =====================================================
-          DESKTOP PANEL
-      ===================================================== */}
-
-      <aside
-        className="
-        absolute
-        bottom-5
-        left-5
-        top-24
-        z-20
-        hidden
-        w-72
-        flex-col
-        gap-3
-        lg:flex
-      "
-      >
-        {/* DETECTION SUMMARY */}
-
-        <div
-          className="
-          rounded-3xl
-          border
-          border-white/10
-          bg-black/50
-          p-5
-          shadow-xl
-          backdrop-blur-xl
-        "
-        >
-          <div
-            className="
-            flex
-            items-end
-            justify-between
-          "
-          >
-            <div>
-              <p
-                className="
-                text-[10px]
-                font-medium
-                uppercase
-                tracking-[0.2em]
-                text-white/40
-              "
-              >
-                Detection
-              </p>
-
-              <h2
-                className="
-                mt-1
-                text-xl
-                font-bold
-              "
-              >
-                Live Monitor
-              </h2>
-            </div>
-
-            <div
-              className="
-              rounded-xl
-              bg-white/5
-              px-3
-              py-2
-              text-right
-            "
-            >
-              <p
-                className="
-                text-[9px]
-                uppercase
-                text-white/40
-              "
-              >
-                Total
-              </p>
-
-              <p
-                className="
-                text-xl
-                font-bold
-              "
-              >
-                {totalObjects}
-              </p>
-            </div>
-          </div>
-        </div>
-
-        {/* MODEL 1 */}
-
-        <div
-          className="
-          rounded-3xl
-          border
-          border-emerald-400/20
-          bg-black/50
-          p-5
-          shadow-xl
-          backdrop-blur-xl
-        "
-        >
-          <div
-            className="
-            flex
-            items-center
-            justify-between
-          "
-          >
-            <div
-              className="
-              flex
-              items-center
-              gap-3
-            "
-            >
-              <span
-                className="
-                h-3
-                w-3
-                rounded-full
-                bg-emerald-400
-              "
-              />
-
-              <span
-                className="
-                text-sm
-                text-white/70
-              "
-              >
-                Model 1
-              </span>
-            </div>
-
-            <span
-              className="
-              text-3xl
-              font-bold
-              text-emerald-400
-            "
-            >
-              {counts.model1}
-            </span>
-          </div>
-
-          <p
-            className="
-            mt-3
-            text-xs
-            text-white/40
-          "
-          >
-            Green detection
-          </p>
-        </div>
-
-        {/* MODEL 2 */}
-
-        <div
-          className="
-          rounded-3xl
-          border
-          border-red-400/20
-          bg-black/50
-          p-5
-          shadow-xl
-          backdrop-blur-xl
-        "
-        >
-          <div
-            className="
-            flex
-            items-center
-            justify-between
-          "
-          >
-            <div
-              className="
-              flex
-              items-center
-              gap-3
-            "
-            >
-              <span
-                className="
-                h-3
-                w-3
-                rounded-full
-                bg-red-400
-              "
-              />
-
-              <span
-                className="
-                text-sm
-                text-white/70
-              "
-              >
-                Model 2
-              </span>
-            </div>
-
-            <span
-              className="
-              text-3xl
-              font-bold
-              text-red-400
-            "
-            >
-              {counts.model2}
-            </span>
-          </div>
-
-          <p
-            className="
-            mt-3
-            text-xs
-            text-white/40
-          "
-          >
-            Red detection
-          </p>
-        </div>
-
-        {/* SYSTEM */}
-
-        <div
-          className="
-          rounded-3xl
-          border
-          border-white/10
-          bg-black/50
-          p-5
-          shadow-xl
-          backdrop-blur-xl
-        "
-        >
-          <p
-            className="
-            text-[10px]
-            font-medium
-            uppercase
-            tracking-[0.2em]
-            text-white/40
-          "
-          >
-            System
-          </p>
-
-          <div
-            className="
-            mt-4
-            space-y-3
-          "
-          >
-            <div
-              className="
-              flex
-              items-center
-              justify-between
-              text-xs
-            "
-            >
-              <span className="text-white/40">WebSocket</span>
-
-              <span
-                className={isConnected ? "text-emerald-400" : "text-red-400"}
-              >
-                {isConnected ? "Connected" : "Disconnected"}
-              </span>
-            </div>
-
-            <div
-              className="
-              flex
-              items-center
-              justify-between
-              text-xs
-            "
-            >
-              <span className="text-white/40">Camera</span>
-
-              <span
-                className={
-                  isCameraReady ? "text-emerald-400" : "text-amber-400"
-                }
-              >
-                {isCameraReady ? "Ready" : "Waiting"}
-              </span>
-            </div>
-
-            <div
-              className="
-              flex
-              items-center
-              justify-between
-              text-xs
-            "
-            >
-              <span className="text-white/40">Last Frame</span>
-
-              <span className="text-white/70">
-                {lastUpdate ? lastUpdate.toLocaleTimeString() : "--:--:--"}
-              </span>
-            </div>
-          </div>
+            <SystemStatus
+              isConnected={isConnected}
+              isCameraReady={isCameraReady}
+              lastUpdate={lastUpdate}
+              perf={perf}
+              debugMessage={debugMessage}
+            />
+          </section>
         </div>
       </aside>
 
       {/* =====================================================
-          MOBILE BOTTOM PANEL
+          STAGE
       ===================================================== */}
 
-      <section
-        className="
-        absolute
-        bottom-0
-        left-0
-        right-0
-        z-30
-        p-3
-        lg:hidden
-      "
-      >
-        <div
-          className="
-          rounded-[28px]
-          border
-          border-white/10
-          bg-black/65
-          p-4
-          shadow-2xl
-          backdrop-blur-2xl
-        "
-        >
-          {/* HANDLE */}
+      <section className="relative min-w-0 flex-1 bg-black">
+        {/* CAMERA / DETECTION VIEW */}
 
-          <div
-            className="
-            mx-auto
-            mb-4
-            h-1
-            w-10
-            rounded-full
-            bg-white/20
-          "
-          />
+        <div className="absolute inset-0 flex items-center justify-center">
+          {annotatedImage ? (
+            <img
+              src={annotatedImage}
+              alt="Live AI detection"
+              draggable={false}
+              className="h-full w-full select-none object-contain"
+            />
+          ) : (
+            <div className="flex max-w-sm flex-col items-center px-6 text-center">
+              {cameraError ? (
+                <>
+                  <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-2xl border border-amber-400/25 bg-amber-400/10 text-amber-300">
+                    <CameraOff className="h-6 w-6" />
+                  </div>
 
-          {/* HEADER */}
+                  <h2 className="text-lg font-semibold tracking-tight">
+                    Camera unavailable
+                  </h2>
 
-          <div
-            className="
-            mb-4
-            flex
-            items-center
-            justify-between
-          "
-          >
-            <div>
-              <p
-                className="
-                text-[9px]
-                font-medium
-                uppercase
-                tracking-[0.2em]
-                text-white/40
-              "
-              >
-                Live Detection
-              </p>
+                  <p className="mt-2 text-sm leading-relaxed text-white/55">
+                    {cameraError}
+                  </p>
 
-              <h2
-                className="
-                mt-1
-                text-lg
-                font-bold
-              "
-              >
-                {totalObjects} Objects
-              </h2>
+                  <Button className="mt-6" onClick={retryCamera}>
+                    <RefreshCw />
+                    Try again
+                  </Button>
+                </>
+              ) : !isConnected ? (
+                <>
+                  <CircularProgress
+                    size={30}
+                    thickness={4}
+                    color="inherit"
+                    className="mb-5 text-white/70"
+                  />
+
+                  <h2 className="text-lg font-semibold tracking-tight">
+                    Connecting to server
+                  </h2>
+
+                  <p className="mt-2 break-all text-sm text-white/45">
+                    {WS_URL}
+                  </p>
+                </>
+              ) : (
+                <>
+                  <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-2xl border border-white/10 bg-white/5 text-white/70">
+                    <ScanSearch className="h-6 w-6" />
+                  </div>
+
+                  <h2 className="text-lg font-semibold tracking-tight">
+                    Waiting for detection
+                  </h2>
+
+                  <p className="mt-2 text-sm text-white/45">
+                    Arahkan kamera ke objek. Hasil akan muncul di sini.
+                  </p>
+
+                  <LinearProgress
+                    color="inherit"
+                    className="mt-6 w-40 rounded-full text-white/60"
+                  />
+                </>
+              )}
             </div>
+          )}
+        </div>
 
-            <div
-              className="
-              flex
-              items-center
-              gap-2
-              rounded-full
-              bg-white/5
-              px-3
-              py-2
-            "
-            >
-              <span
-                className={`
-                  h-2
-                  w-2
-                  rounded-full
-                  ${isConnected ? "animate-pulse bg-emerald-400" : "bg-red-400"}
-                `}
-              />
+        {/* SOFT EDGE SHADE, supaya kontrol tetap terbaca di atas video */}
 
-              <span
-                className="
-                text-[10px]
-                font-semibold
-              "
-              >
-                {isConnected ? "LIVE" : "OFFLINE"}
-              </span>
-            </div>
+        <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-black/50 via-transparent to-black/60" />
+
+        {/* VIEWFINDER */}
+
+        <Viewfinder mode={mode} />
+
+        {/* TOP BAR */}
+
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-start justify-between gap-2 p-3 pt-[max(0.75rem,env(safe-area-inset-top))] lg:p-6">
+          {/* Mobile: brand */}
+          <div className="pointer-events-auto rounded-2xl border border-white/10 bg-slate-950/60 px-3 py-2 backdrop-blur-xl lg:hidden">
+            <Brand />
           </div>
 
-          {/* COUNTERS */}
+          {/* Desktop: mode aktif */}
+          <div className="pointer-events-auto hidden lg:block">
+            <Badge className="gap-2 bg-slate-950/60 py-1.5 pl-2.5 pr-3 backdrop-blur-xl">
+              <ModeIcon className={`h-4 w-4 ${modeIconClass}`} />
 
-          <div
-            className="
-            grid
-            grid-cols-2
-            gap-2
-          "
-          >
-            {/* MODEL 1 */}
-
-            <div
-              className="
-              rounded-2xl
-              border
-              border-emerald-400/20
-              bg-emerald-400/5
-              p-4
-            "
-            >
-              <div
-                className="
-                flex
-                items-center
-                gap-2
-              "
-              >
-                <span
-                  className="
-                  h-2
-                  w-2
-                  rounded-full
-                  bg-emerald-400
-                  "
-                />
-
-                <span
-                  className="
-                  text-[11px]
-                  text-white/50
-                "
-                >
-                  Model 1
-                </span>
-              </div>
-
-              <p
-                className="
-                mt-1
-                text-2xl
-                font-bold
-                text-emerald-400
-              "
-              >
-                {counts.model1}
-              </p>
-            </div>
-
-            {/* MODEL 2 */}
-
-            <div
-              className="
-              rounded-2xl
-              border
-              border-red-400/20
-              bg-red-400/5
-              p-4
-            "
-            >
-              <div
-                className="
-                flex
-                items-center
-                gap-2
-              "
-              >
-                <span
-                  className="
-                  h-2
-                  w-2
-                  rounded-full
-                  bg-red-400
-                  "
-                />
-
-                <span
-                  className="
-                  text-[11px]
-                  text-white/50
-                "
-                >
-                  Model 2
-                </span>
-              </div>
-
-              <p
-                className="
-                mt-1
-                text-2xl
-                font-bold
-                text-red-400
-              "
-              >
-                {counts.model2}
-              </p>
-            </div>
+              <span>{MODE_SUMMARY[mode]}</span>
+            </Badge>
           </div>
 
-          {/* STATUS */}
+          <div className="pointer-events-auto flex items-center gap-2">
+            {/* Mobile: status */}
+            <StatusPill
+              isConnected={isConnected}
+              className="bg-slate-950/60 backdrop-blur-xl lg:hidden"
+            />
 
-          <div
-            className="
-            mt-2
-            flex
-            items-center
-            justify-between
-            rounded-2xl
-            border
-            border-white/10
-            bg-white/5
-            px-4
-            py-3
-          "
-          >
-            <div
-              className="
-              flex
-              items-center
-              gap-2
-            "
-            >
-              <span
-                className={`
-                  h-2
-                  w-2
-                  rounded-full
-                  ${isCameraReady ? "bg-emerald-400" : "bg-amber-400"}
-                `}
-              />
+            {/* Desktop: fps + aksi */}
+            {perf && (
+              <Badge className="hidden gap-1.5 bg-slate-950/60 py-1.5 backdrop-blur-xl tabular-nums lg:inline-flex">
+                <Gauge />
+                {perf.fps.toFixed(1)} fps
+              </Badge>
+            )}
 
-              <span
-                className="
-                text-xs
-                text-white/60
-              "
-              >
-                Camera
-              </span>
+            <div className="hidden items-center gap-2 lg:flex">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="secondary"
+                    size="icon"
+                    className="bg-slate-950/60 backdrop-blur-xl"
+                    onClick={toggleFullscreen}
+                    aria-label={fullscreenLabel}
+                  >
+                    {isFullscreen ? <Minimize /> : <Maximize />}
+                  </Button>
+                </TooltipTrigger>
+
+                <TooltipContent>{fullscreenLabel}</TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="secondary"
+                    size="icon"
+                    className="bg-slate-950/60 backdrop-blur-xl"
+                    onClick={reconnect}
+                    aria-label="Reconnect"
+                  >
+                    <RefreshCw />
+                  </Button>
+                </TooltipTrigger>
+
+                <TooltipContent>Reconnect</TooltipContent>
+              </Tooltip>
             </div>
-
-            <span
-              className="
-              text-xs
-              font-semibold
-            "
-            >
-              {isCameraReady ? "Ready" : "Waiting"}
-            </span>
-          </div>
-
-          {/* BUTTONS */}
-
-          <div
-            className="
-            mt-2
-            grid
-            grid-cols-2
-            gap-2
-          "
-          >
-            <button
-              type="button"
-              onClick={toggleFullscreen}
-              className="
-                rounded-2xl
-                border
-                border-white/10
-                bg-white/10
-                py-3
-                text-xs
-                font-semibold
-                transition
-                active:scale-[0.98]
-              "
-            >
-              {isFullscreen ? "Exit Fullscreen" : "Fullscreen"}
-            </button>
-
-            <button
-              type="button"
-              onClick={reconnect}
-              className="
-                rounded-2xl
-                border
-                border-white/10
-                bg-white/10
-                py-3
-                text-xs
-                font-semibold
-                transition
-                active:scale-[0.98]
-              "
-            >
-              Reconnect
-            </button>
           </div>
         </div>
+
+        {/* MOBILE DOCK + DRAWER (MUI) */}
+
+        <MobileDock
+          counts={counts}
+          mode={mode}
+          onModeChange={changeMode}
+          open={detailsOpen}
+          onOpen={() => setDetailsOpen(true)}
+          onClose={() => setDetailsOpen(false)}
+        >
+          <SystemStatus
+            isConnected={isConnected}
+            isCameraReady={isCameraReady}
+            lastUpdate={lastUpdate}
+            perf={perf}
+            debugMessage={debugMessage}
+          />
+
+          <p className="mt-4 text-xs leading-relaxed text-white/45">
+            {MODE_DESCRIPTIONS[mode]}
+          </p>
+
+          {detailActions}
+        </MobileDock>
       </section>
 
       {/* =====================================================
-          DESKTOP FOOTER
+          TOAST (MUI Snackbar)
       ===================================================== */}
 
-      <div
-        className="
-        absolute
-        bottom-5
-        right-5
-        z-20
-        hidden
-        items-center
-        gap-2
-        rounded-full
-        border
-        border-white/10
-        bg-black/40
-        px-4
-        py-2
-        text-xs
-        text-white/50
-        backdrop-blur-xl
-        lg:flex
-      "
+      <Snackbar
+        open={toast.open}
+        autoHideDuration={2400}
+        onClose={closeToast}
+        anchorOrigin={{ vertical: "top", horizontal: "center" }}
+        sx={{ top: { xs: 84, lg: 24 } }}
       >
-        <span
-          className="
-          h-1.5
-          w-1.5
-          rounded-full
-          bg-emerald-400
-          "
-        />
-        AI Detection Engine
-        <span className="text-white/20">•</span>
-        {lastUpdate ? lastUpdate.toLocaleTimeString() : "Waiting..."}
-      </div>
+        <Alert
+          severity={toast.severity}
+          variant="outlined"
+          onClose={closeToast}
+          sx={{
+            alignItems: "center",
+            borderRadius: "16px",
+            backgroundColor: "rgba(2, 6, 23, 0.88)",
+            backdropFilter: "blur(16px)",
+            fontSize: 13,
+          }}
+        >
+          {toast.message}
+        </Alert>
+      </Snackbar>
     </main>
   );
 }

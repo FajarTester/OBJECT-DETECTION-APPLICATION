@@ -1,3 +1,9 @@
 __pycache__
 venv
 models_onnx/
+# Abaikan semua file yang berawalan dengan .env
+.env.*
+.env
+
+# KECUALIKAN file .env.example agar tetap di-track oleh Git
+!.env.example
