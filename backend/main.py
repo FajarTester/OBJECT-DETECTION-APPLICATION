@@ -1,5 +1,7 @@
+import os 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from routers.vision_routes import router as vision_router
 from routers.chat_routes import router as chat_router
@@ -15,7 +17,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Registrasi file routes (Router) ke dalam aplikasi utama
+os.makedirs("static/exports", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 app.include_router(vision_router)
 app.include_router(chat_router)
 

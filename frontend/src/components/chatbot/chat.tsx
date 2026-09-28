@@ -1,5 +1,5 @@
-import React, { useState, useRef, useEffect } from "react";
-import { MessageSquare, X, Send } from "lucide-react";
+import { useState, useRef, useEffect } from "react";
+import { MessageSquare, X, Send, Download } from "lucide-react";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import {
@@ -11,18 +11,26 @@ import {
 } from "../ui/card";
 import { ScrollArea } from "../ui/scroll-area";
 import axios from "axios";
+import ReactMarkdown from "react-markdown";
+
+interface Message {
+  role: "user" | "ai";
+  text: string;
+}
 
 export default function ChatWidget() {
   const [isOpen, setIsOpen] = useState(false);
   const [input, setInput] = useState("");
-  const [messages, setMessages] = useState([
+  const [messages, setMessages] = useState<Message[]>([
     {
       role: "ai",
       text: "Halo! Ada yang bisa saya bantu terkait pantauan visual objek saat ini?",
     },
   ]);
   const [isLoading, setIsLoading] = useState(false);
-  const scrollRef = useRef(null);
+
+  // Tentukan tipe HTMLDivElement untuk useRef
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll ke pesan paling bawah setiap kali ada chat baru
   useEffect(() => {
@@ -70,9 +78,19 @@ export default function ChatWidget() {
     }
   };
 
+  // Tambahkan tipe : string pada parameter href
+  const formatFileUrl = (href?: string) => {
+    if (!href) return "#";
+    if (href.startsWith("/static")) {
+      const baseUrl = import.meta.env.VITE_API_URL || "";
+      return `${baseUrl}${href}`;
+    }
+    return href;
+  };
+
   return (
     <div className="fixed bottom-4 right-4 sm:bottom-6 sm:right-6 z-50 flex flex-col items-end w-full max-w-[calc(100%-2rem)] sm:w-auto">
-      {/* 1. Jendela Chatbox (Responsif & Efek Blur Biru Tua Kehitaman) */}
+      {/* 1. Jendela Chatbox */}
       {isOpen && (
         <Card className="w-[calc(100vw-2rem)] sm:w-96 h-[380px] sm:h-[500px] mb-4 shadow-2xl flex flex-col border border-slate-800 bg-slate-950/75 backdrop-blur-md animate-in fade-in slide-in-from-bottom-5 duration-200">
           {/* Header */}
@@ -112,12 +130,36 @@ export default function ChatWidget() {
                           : "bg-slate-900/80 border border-slate-800 text-slate-200 shadow-sm"
                       }`}
                     >
-                      {msg.text}
+                      {/* Render teks dengan ReactMarkdown untuk mendeteksi link download */}
+                      <ReactMarkdown
+                        components={{
+                          a: ({ href, children, ...props }) => {
+                            const downloadUrl = formatFileUrl(href);
+                            return (
+                              <a
+                                href={downloadUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="mt-2 inline-flex items-center gap-2 bg-green-600/20 border border-green-500/40 text-green-400 hover:bg-green-600/30 px-3 py-1.5 rounded-md font-medium text-xs transition-colors"
+                                {...props}
+                              >
+                                <Download className="h-3.5 w-3.5" />
+                                {children}
+                              </a>
+                            );
+                          },
+                          p: ({ children }) => (
+                            <p className="mb-1 last:mb-0">{children}</p>
+                          ),
+                        }}
+                      >
+                        {msg.text}
+                      </ReactMarkdown>
                     </div>
                   </div>
                 ))}
 
-                {/* Indikator Loading Skleton / Typing */}
+                {/* Indikator Loading */}
                 {isLoading && (
                   <div className="flex justify-start">
                     <div className="bg-slate-900/80 border border-slate-800 text-slate-400 max-w-[85%] rounded-lg px-3 py-2 text-sm animate-pulse flex items-center gap-1">
@@ -138,7 +180,7 @@ export default function ChatWidget() {
             <div className="flex w-full items-center space-x-2">
               <Input
                 type="text"
-                placeholder="Tanya jumlah objek..."
+                placeholder="Tanya / minta buatkan file Excel..."
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleSend()}
